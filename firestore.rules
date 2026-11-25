@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 도둑차 대탈주 순위표: 누구나 읽고, 각자 자기 기록 하나만 올림(최고점 갱신 때만).
+    match /chase_scores/{uid} {
+      function valid() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['nick', 'best', 'cash', 'time', 'wrecked', 'stars', 'at'])
+          && d.nick is string && d.nick.size() > 0 && d.nick.size() <= 12
+          && d.best is int && d.best > 0 && d.best <= 5000000
+          && d.time is int && d.time >= 5 && d.time <= 36000
+          && d.best <= (d.time + 10) * 4000
+          && d.cash is int && d.cash >= 0
+          && d.wrecked is int && d.wrecked >= 0 && d.wrecked <= 1000
+          && d.stars is int && d.stars >= 1 && d.stars <= 5
+          && d.at == request.time;
+      }
+      allow read: if true;
+      allow create: if request.auth != null && request.auth.uid == uid && valid();
+      allow update: if request.auth != null && request.auth.uid == uid && valid()
+        && request.resource.data.best > resource.data.best;
+      allow delete: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
