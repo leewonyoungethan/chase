@@ -1603,51 +1603,125 @@ function gotRows(rows) {
   if (mine) LB.myBest = Math.max(LB.myBest, mine.best || 0);
   LB.state = 'ok'; renderBoard();
 }
-// Public leaderboard for the GitHub Pages version: each score is a GitHub issue in this repo.
-// Anyone can read it; posting needs a (free) GitHub account. Closing an issue removes that entry.
-const GH_REPO = 'leewonyoungethan/chase';
-const GH_TAG = '[순위]';
+// Public leaderboard for the GitHub Pages version.
+// Scores live in a free, account-free JSON store (jsonblob.com). Its id is published once by the repo owner
+// as a GitHub issue titled "[순위저장소] <id>" (made from this page with ?setup). Scores posted as GitHub issues
+// titled "[순위]" also count, as a fallback. Anyone can read; nobody needs an account to post to the store.
+const GH_REPO = 'leewonyoungethan/chase', GH_OWNER = 'leewonyoungethan';
+const GH_TAG = '[순위]', STORE_TAG = '[순위저장소]';
+const BLOB_API = 'https://jsonblob.com/api/jsonBlob';
+let BLOB_ID = null;
 let ghLoadedAt = 0;
-async function loadGithubBoard() {
-  if (Date.now() - ghLoadedAt < 30000 && LB.state === 'ok') return;
+function myPid() {
+  let id = store.get('chase_pid');
+  if (!id) { id = Math.random().toString(36).slice(2, 12) + Date.now().toString(36); store.set('chase_pid', id); }
+  return id;
+}
+function plausibleRow(id, d, fallbackNick) {
+  const sc = Math.round(+d.best);
+  if (!(sc > 0 && sc <= 5000000) || !(+d.time >= 5) || sc > (+d.time + 10) * 4000) return null;
+  return { id, nick: String(d.nick || fallbackNick || '익명 도둑').slice(0, 12), best: sc, time: +d.time || 0, stars: clamp(Math.round(+d.stars) || 1, 1, 5) };
+}
+async function loadGithubBoard(force) {
+  if (!force && Date.now() - ghLoadedAt < 30000 && LB.state === 'ok') return;
   ghLoadedAt = Date.now();
+  const best = new Map();
+  const add = row => { if (row && (!best.has(row.id) || best.get(row.id).best < row.best)) best.set(row.id, row); };
+  let ok = false;
   try {
-    const best = new Map();
     for (let page = 1; page <= 3; page++) {
       const r = await fetch(`https://api.github.com/repos/${GH_REPO}/issues?state=open&per_page=100&page=${page}`, { headers: { Accept: 'application/vnd.github+json' } });
       if (!r.ok) throw new Error('http ' + r.status);
       const list = await r.json();
       for (const it of list) {
-        if (it.pull_request || !it.title || !it.title.startsWith(GH_TAG)) continue;
+        if (it.pull_request || !it.title) continue;
+        const who = it.user ? it.user.login : '?';
+        if (it.title.startsWith(STORE_TAG)) {
+          const m = /([A-Za-z0-9-]{8,})\s*$/.exec(it.title);
+          if (m && who === GH_OWNER && !BLOB_ID) BLOB_ID = m[1];
+          continue;
+        }
+        if (!it.title.startsWith(GH_TAG)) continue;
         const m = /chase-score:(\{[^\n]*\})/.exec(it.body || '');
         if (!m) continue;
-        let d; try { d = JSON.parse(m[1]); } catch (e) { continue; }
-        const sc = Math.round(+d.best);
-        if (!(sc > 0 && sc <= 5000000) || !(+d.time >= 5) || sc > (+d.time + 10) * 4000) continue;
-        const who = it.user ? it.user.login : '?';
-        const row = { id: who, nick: String(d.nick || who).slice(0, 12), best: sc, time: +d.time || 0, stars: clamp(+d.stars || 1, 1, 5) };
-        if (!best.has(who) || best.get(who).best < sc) best.set(who, row);
+        try { add(plausibleRow('gh:' + who, JSON.parse(m[1]), who)); } catch (e) {}
       }
       if (list.length < 100) break;
     }
+    ok = true;
+  } catch (e) {}
+  if (BLOB_ID) {
+    try {
+      const r = await fetch(`${BLOB_API}/${BLOB_ID}`, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+      if (r.ok) {
+        const data = await r.json();
+        const sc = data && typeof data.scores === 'object' && data.scores ? data.scores : {};
+        for (const pid of Object.keys(sc)) add(plausibleRow('p:' + pid, sc[pid] || {}));
+        ok = true;
+      }
+    } catch (e) {}
+  }
+  if (ok) {
     LB.rows = [...best.values()].sort((a, b) => b.best - a.best).slice(0, 30);
+    const mine = best.get(LB.uid); if (mine) LB.myBest = Math.max(LB.myBest, mine.best);
     LB.state = 'ok';
-  } catch (e) { if (LB.state !== 'ok') LB.state = 'error'; }
+  } else if (LB.state !== 'ok') LB.state = 'error';
   renderBoard();
+}
+async function blobSave(d) {
+  let data = null;
+  const g = await fetch(`${BLOB_API}/${BLOB_ID}`, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+  if (g.ok) { try { data = await g.json(); } catch (e) {} }
+  if (!data || typeof data !== 'object' || typeof data.scores !== 'object' || !data.scores) data = { v: 1, scores: {} };
+  const pid = myPid(), cur = data.scores[pid];
+  if (!cur || (+cur.best || 0) < d.best) data.scores[pid] = { nick: d.nick, best: d.best, time: d.time, stars: d.stars, at: Date.now() };
+  const keep = Object.entries(data.scores).sort((a, b) => (+b[1].best || 0) - (+a[1].best || 0)).slice(0, 300);
+  data.scores = Object.fromEntries(keep);
+  const r = await fetch(`${BLOB_API}/${BLOB_ID}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(data) });
+  if (!r.ok) throw new Error('http ' + r.status);
 }
 async function initBoard() {
   renderBoard();
   const cl = window.claude;
   if (cl && cl.use) return initClaudeBoard(cl);
   if (FIREBASE_CONFIG) return initFirebaseBoard(FIREBASE_CONFIG);
-  LB.gh = true; LB.canWrite = null;
-  loadGithubBoard();
+  LB.gh = true; LB.canWrite = null; LB.uid = 'p:' + myPid();
+  await loadGithubBoard(true);
+  if (/[?&]setup\b/.test(location.search)) showStoreSetup();
+}
+// One-time owner setup: open the game with ?setup to create the shared score store.
+function showStoreSetup() {
+  const wrap = document.createElement('div'); wrap.className = 'screen'; wrap.style.zIndex = 20;
+  const card = document.createElement('div'); card.className = 'panel card'; wrap.appendChild(card);
+  const h = document.createElement('h2'); h.textContent = '순위 저장소 만들기'; card.appendChild(h);
+  const p = document.createElement('p'); p.className = 'lead'; card.appendChild(p);
+  const btn = document.createElement('button'); btn.className = 'go'; btn.type = 'button'; card.appendChild(btn);
+  const close = document.createElement('button'); close.className = 'ghost'; close.type = 'button'; close.textContent = '닫기'; close.onclick = () => wrap.remove(); card.appendChild(close);
+  if (BLOB_ID) { p.textContent = `이미 연결된 저장소가 있습니다 (${BLOB_ID}). 새로 만들 필요 없어요.`; btn.hidden = true; }
+  else { p.textContent = '버튼을 누르면 무료 저장소가 만들어집니다. 그다음 GitHub에서 Create 한 번만 누르면 끝!'; btn.textContent = '1. 저장소 만들기'; }
+  btn.onclick = async () => {
+    btn.disabled = true; btn.textContent = '만드는 중…';
+    try {
+      const r = await fetch(BLOB_API, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ v: 1, scores: {} }) });
+      const id = r.headers.get('x-jsonblob-id') || (r.headers.get('location') || '').split('/').pop();
+      if (!r.ok || !id) throw new Error('상태 ' + r.status + (id ? '' : ', 저장소 번호를 받지 못함'));
+      p.textContent = `저장소가 만들어졌습니다: ${id}\n이제 아래 버튼 → GitHub에서 Create 를 누르세요. 그러면 모든 플레이어가 이 저장소를 씁니다.`;
+      p.style.whiteSpace = 'pre-line';
+      const a = document.createElement('a'); a.className = 'ghost gh'; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = '2. GitHub에 등록하기 (Create)';
+      a.href = `https://github.com/${GH_REPO}/issues/new?title=${encodeURIComponent(STORE_TAG + ' ' + id)}&body=${encodeURIComponent('도둑차 대탈주 순위 저장소입니다. 이 이슈를 닫지 마세요.')}`;
+      btn.replaceWith(a);
+    } catch (e) {
+      btn.disabled = false; btn.textContent = '다시 시도';
+      p.textContent = '저장소를 만들지 못했습니다 (' + (e.message || e) + '). 잠시 후 다시 시도하거나 Claude에게 이 메시지를 알려 주세요.';
+    }
+  };
+  document.body.appendChild(wrap);
 }
 function githubSubmit() {
   const a = $('ghSubmit'), note = $('ghNote');
   a.hidden = true; note.hidden = true;
   if (!LB.gh) return;
-  loadGithubBoard();
   const score = Math.round(G.score);
   if (score <= 0 || G.t < 5) return;
   const d = { nick: myNick(), best: score, time: Math.round(G.t), stars: G.maxStars, cash: Math.round(G.cash), wrecked: G.wrecked, v: 1 };
@@ -1656,9 +1730,28 @@ function githubSubmit() {
   a.href = `https://github.com/${GH_REPO}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
   a.hidden = false; note.hidden = false;
 }
+async function publicSubmit() {
+  const el = $('submitMsg');
+  const score = Math.round(G.score);
+  if (score <= 0 || G.t < 5) return;
+  if (!BLOB_ID) { githubSubmit(); return; }
+  if (score <= LB.myBest) { el.textContent = `내 순위표 기록은 ${fmtNum(LB.myBest)}점입니다.`; return; }
+  el.textContent = '순위표에 올리는 중…';
+  try {
+    await blobSave({ nick: myNick(), best: score, time: Math.round(G.t), stars: G.maxStars });
+    LB.myBest = score;
+    await loadGithubBoard(true);
+    const rank = LB.rows ? LB.rows.filter(r => r.id !== LB.uid && r.best > score).length + 1 : null;
+    el.textContent = rank ? `순위표에 올라갔습니다! 현재 ${rank}위` : '순위표에 올라갔습니다!';
+  } catch (e) {
+    el.textContent = '자동 등록에 실패했습니다. 아래 버튼으로 GitHub에 올릴 수 있어요.';
+    githubSubmit();
+  }
+}
 async function submitScore() {
   const el = $('submitMsg'); el.textContent = '';
-  githubSubmit();
+  $('ghSubmit').hidden = true; $('ghNote').hidden = true;
+  if (LB.gh) return publicSubmit();
   if (!LB.save || !LB.uid || LB.canWrite === false) return;
   const score = Math.round(G.score);
   if (score <= 0 || G.t < 5) return;
