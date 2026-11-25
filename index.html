@@ -119,6 +119,8 @@
   .tips b { color: var(--ink); font-weight: 600; }
   .go { width: 100%; padding: 15px; border: 0; border-radius: 10px; background: var(--gold); color: #1a1300; font-family: var(--display); font-size: 22px; }
   .go:hover { filter: brightness(1.08); }
+  a.ghost { display: block; text-align: center; text-decoration: none; color: var(--ink); box-sizing: border-box; }
+  a.ghost.gh { background: var(--gold); color: #1a1300; border: 0; font-weight: 700; font-size: 15px; padding: 13px; }
   .ghost { width: 100%; margin-top: 8px; padding: 11px; border-radius: 10px; border: 1px solid var(--line); background: transparent; font-size: 14px; }
   .best { text-align: center; font-size: 13px; color: var(--muted); margin-top: 12px; font-variant-numeric: tabular-nums; }
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 16px 0 20px; }
@@ -252,6 +254,8 @@
       <div class="stat"><div class="lbl">최고 수배 레벨</div><div class="v" id="fStars">★1</div></div>
     </div>
     <div id="submitMsg"></div>
+    <a class="ghost gh" id="ghSubmit" hidden target="_blank" rel="noopener">🏆 이 점수 순위표에 올리기 (GitHub)</a>
+    <div class="best" id="ghNote" hidden>GitHub에서 '이슈 만들기(Create)'를 누르면 등록됩니다. 1분쯤 뒤 순위표에 나타나요.</div>
     <button class="go" id="againBtn" type="button">한 번 더! <span class="kbOnly" style="font-size:14px;opacity:.7">(R)</span></button>
     <div class="best" id="bestOver"></div>
     <div class="board"><h3>순위표 <small>최고 점수 기준</small></h3><ol class="boardList"></ol></div>
@@ -1530,6 +1534,7 @@ function renderBoard() {
     ol.textContent = '';
     const msg = t => { const li = document.createElement('div'); li.className = 'msg'; li.textContent = t; ol.appendChild(li); };
     if (LB.state === 'off') { msg('순위표 서버가 아직 연결되지 않았습니다.'); continue; }
+    if (LB.state === 'error' && LB.gh) { msg('순위표를 불러오지 못했습니다. 잠시 후 다시 열어 보세요.'); continue; }
     if (LB.state === 'loading') { msg('순위표를 불러오는 중…'); continue; }
     if (LB.state === 'error') { msg('순위표를 불러오지 못했습니다. 잠시 후 다시 열어 보세요.'); continue; }
     if (!LB.rows.length) { msg('아직 기록이 없습니다. 첫 번째 주인공이 되어 보세요!'); }
@@ -1598,15 +1603,62 @@ function gotRows(rows) {
   if (mine) LB.myBest = Math.max(LB.myBest, mine.best || 0);
   LB.state = 'ok'; renderBoard();
 }
+// Public leaderboard for the GitHub Pages version: each score is a GitHub issue in this repo.
+// Anyone can read it; posting needs a (free) GitHub account. Closing an issue removes that entry.
+const GH_REPO = 'leewonyoungethan/chase';
+const GH_TAG = '[순위]';
+let ghLoadedAt = 0;
+async function loadGithubBoard() {
+  if (Date.now() - ghLoadedAt < 30000 && LB.state === 'ok') return;
+  ghLoadedAt = Date.now();
+  try {
+    const best = new Map();
+    for (let page = 1; page <= 3; page++) {
+      const r = await fetch(`https://api.github.com/repos/${GH_REPO}/issues?state=open&per_page=100&page=${page}`, { headers: { Accept: 'application/vnd.github+json' } });
+      if (!r.ok) throw new Error('http ' + r.status);
+      const list = await r.json();
+      for (const it of list) {
+        if (it.pull_request || !it.title || !it.title.startsWith(GH_TAG)) continue;
+        const m = /chase-score:(\{[^\n]*\})/.exec(it.body || '');
+        if (!m) continue;
+        let d; try { d = JSON.parse(m[1]); } catch (e) { continue; }
+        const sc = Math.round(+d.best);
+        if (!(sc > 0 && sc <= 5000000) || !(+d.time >= 5) || sc > (+d.time + 10) * 4000) continue;
+        const who = it.user ? it.user.login : '?';
+        const row = { id: who, nick: String(d.nick || who).slice(0, 12), best: sc, time: +d.time || 0, stars: clamp(+d.stars || 1, 1, 5) };
+        if (!best.has(who) || best.get(who).best < sc) best.set(who, row);
+      }
+      if (list.length < 100) break;
+    }
+    LB.rows = [...best.values()].sort((a, b) => b.best - a.best).slice(0, 30);
+    LB.state = 'ok';
+  } catch (e) { if (LB.state !== 'ok') LB.state = 'error'; }
+  renderBoard();
+}
 async function initBoard() {
   renderBoard();
   const cl = window.claude;
   if (cl && cl.use) return initClaudeBoard(cl);
   if (FIREBASE_CONFIG) return initFirebaseBoard(FIREBASE_CONFIG);
-  LB.state = 'off'; renderBoard();
+  LB.gh = true; LB.canWrite = null;
+  loadGithubBoard();
+}
+function githubSubmit() {
+  const a = $('ghSubmit'), note = $('ghNote');
+  a.hidden = true; note.hidden = true;
+  if (!LB.gh) return;
+  loadGithubBoard();
+  const score = Math.round(G.score);
+  if (score <= 0 || G.t < 5) return;
+  const d = { nick: myNick(), best: score, time: Math.round(G.t), stars: G.maxStars, cash: Math.round(G.cash), wrecked: G.wrecked, v: 1 };
+  const title = `${GH_TAG} ${d.nick} - ${fmtNum(score)}점`;
+  const body = `🚓 도둑차 대탈주 기록\n\n- 닉네임: ${d.nick}\n- 점수: ${fmtNum(score)}\n- 도주 시간: ${fmtTime(G.t)}\n- 최고 수배: ★${G.maxStars}\n- 격파한 경찰차: ${G.wrecked}대\n\n아래 줄은 지우지 마세요.\nchase-score:${JSON.stringify(d)}`;
+  a.href = `https://github.com/${GH_REPO}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  a.hidden = false; note.hidden = false;
 }
 async function submitScore() {
   const el = $('submitMsg'); el.textContent = '';
+  githubSubmit();
   if (!LB.save || !LB.uid || LB.canWrite === false) return;
   const score = Math.round(G.score);
   if (score <= 0 || G.t < 5) return;
